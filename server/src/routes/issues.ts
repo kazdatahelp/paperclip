@@ -14983,7 +14983,7 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
-      const queue = await runQueuedCommentMutation(() =>
+      const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.editQueuedComment({
           issue: buildQueuedCommentIssueContext(issue),
           actor,
@@ -14994,6 +14994,7 @@ export function issueRoutes(
           now: new Date(),
         }),
       );
+      publishActivity(activityPublication as ActivityPublication);
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
     },
   );
@@ -15013,7 +15014,7 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
-      const queue = await runQueuedCommentMutation(() =>
+      const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.reorderQueuedComments({
           issue: buildQueuedCommentIssueContext(issue),
           actor,
@@ -15023,6 +15024,7 @@ export function issueRoutes(
           now: new Date(),
         }),
       );
+      publishActivity(activityPublication as ActivityPublication);
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
     },
   );
@@ -15106,8 +15108,10 @@ export function issueRoutes(
           queueId: req.body.queueId,
           revision: req.body.revision,
           now: new Date(),
+          logActivity: true,
         }),
       );
+      publishActivity(result.activityPublication as ActivityPublication);
       // Telemetry is best-effort background work; it must not delay the
       // response with a slow lookup, so fire it and do not await it.
       if (result.cancelledRun) {
