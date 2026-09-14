@@ -391,15 +391,20 @@ export function isForeignStopSnapshot(value: unknown): boolean {
 }
 
 // Milliseconds since the watchdog row was last written by any build, or null when the
-// row carries no timestamp this process can read.
+// row carries no timestamp this process can read. Both timestamps move when a build
+// writes the row, and either one can be the newer value, so the age comes from the most
+// recent readable timestamp: a row that another build just refreshed is not stale, and a
+// row that only carries an old review write is.
 function watchdogRowAgeMs(watchdog: {
   lastCompletedAt?: Date | string | null;
   updatedAt?: Date | string | null;
 }): number | null {
-  const seenAt = watchdog.lastCompletedAt ?? watchdog.updatedAt ?? null;
-  if (!seenAt) return null;
-  const age = Date.now() - new Date(seenAt).getTime();
-  return Number.isFinite(age) ? Math.max(age, 0) : null;
+  const writtenAt = [watchdog.lastCompletedAt, watchdog.updatedAt]
+    .filter((value): value is Date | string => value != null)
+    .map((value) => new Date(value).getTime())
+    .filter((value) => Number.isFinite(value));
+  if (writtenAt.length === 0) return null;
+  return Math.max(0, Date.now() - Math.max(...writtenAt));
 }
 
 function foreignReviewGraceRemainingMs(watchdog: {

@@ -201,6 +201,20 @@ describe("task watchdog stop fingerprints written under another schema version",
     expect(result.state).toBe("stopped");
   });
 
+  it("keeps a foreign review fresh when the newest write is an observation timestamp", () => {
+    // The other build reviewed the stop a while ago and then refreshed the row with a new
+    // observation. Both timestamps move on a write and either one can be the newer value,
+    // so the row must not look stale: an early take-over would wake the agent again.
+    const result = classify({
+      lastReviewedFingerprint: foreignFingerprint,
+      lastReviewedStopSnapshot: foreignStopSnapshot(foreignFingerprint),
+      lastCompletedAt: writtenBeforeGraceWindow(),
+      updatedAt: justWritten(),
+    });
+
+    expect(result.state).toBe("already_reviewed");
+  });
+
   it("keeps a foreign stored snapshot readable on the production input path", () => {
     // Regression: the service used to pre-parse the stored snapshot under this build's
     // schema, which turned a foreign snapshot into null before the classifier could
