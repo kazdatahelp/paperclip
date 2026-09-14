@@ -58,8 +58,19 @@ function foreignStopSnapshot(fingerprint: string) {
   };
 }
 
+// Grace window the service uses before this build takes a row over from a build that
+// writes stop snapshots under another schema version (TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS).
+const foreignReviewGraceMs = 6 * 60 * 60 * 1000;
+const justWritten = () => new Date();
+const writtenBeforeGraceWindow = () => new Date(Date.now() - foreignReviewGraceMs - 60_000);
+
 function classify(
-  watchdog: { lastReviewedFingerprint?: string | null; lastReviewedStopSnapshot?: unknown } = {},
+  watchdog: {
+    lastReviewedFingerprint?: string | null;
+    lastReviewedStopSnapshot?: unknown;
+    lastCompletedAt?: Date | string | null;
+    updatedAt?: Date | string | null;
+  } = {},
 ) {
   return classifyTaskWatchdogSubtree({
     watchdog: {
@@ -74,9 +85,14 @@ function classify(
 
 type StoredWatchdogRow = Parameters<typeof classifierWatchdogConfigFromStoredRow>[0];
 
-// Minimal stand-in for a row loaded from `issue_watchdogs`: the stored snapshot keeps
-// the jsonb value exactly as Postgres returns it, which is what the service passes on.
-function storedWatchdogRow(lastReviewedStopSnapshot: unknown) {
+// Stand-in for a row loaded from `issue_watchdogs`: the stored snapshot keeps the jsonb
+// value exactly as Postgres returns it, which is what the service passes on. `seenAt`
+// controls how long ago the row was written, i.e. whether the build that owns the
+// foreign review is still considered alive.
+function storedWatchdogRow(
+  lastReviewedStopSnapshot: unknown,
+  seenAt: { lastCompletedAt?: Date | null; updatedAt?: Date } = {},
+) {
   return {
     id: "watchdog-1",
     companyId,
@@ -88,18 +104,23 @@ function storedWatchdogRow(lastReviewedStopSnapshot: unknown) {
     lastObservedFingerprint: null,
     lastReviewedFingerprint: foreignFingerprint,
     lastTriggeredAt: null,
-    lastCompletedAt: null,
+    lastCompletedAt: seenAt.lastCompletedAt ?? null,
     triggerCount: 1,
     createdAt: new Date("2026-09-10T21:00:00.000Z"),
-    updatedAt: new Date("2026-09-10T21:00:00.000Z"),
+    updatedAt: seenAt.updatedAt ?? new Date("2026-09-10T21:00:00.000Z"),
     lastReviewedStopSnapshot,
   } as unknown as StoredWatchdogRow;
 }
 
 // Classifies through the same conversion the service uses for stored watchdog rows.
-function classifyStoredRow(lastReviewedStopSnapshot: unknown) {
+function classifyStoredRow(
+  lastReviewedStopSnapshot: unknown,
+  seenAt: { lastCompletedAt?: Date | null; updatedAt?: Date } = {},
+) {
   return classifyTaskWatchdogSubtree({
-    watchdog: classifierWatchdogConfigFromStoredRow(storedWatchdogRow(lastReviewedStopSnapshot)),
+    watchdog: classifierWatchdogConfigFromStoredRow(
+      storedWatchdogRow(lastReviewedStopSnapshot, seenAt),
+    ),
     issues: [issue()],
   });
 }
@@ -113,32 +134,91 @@ describe("task watchdog stop fingerprints written under another schema version",
       fingerprint: otherFingerprint,
     })).toBe(false);
     expect(isForeignStopSnapshot(foreignStopSnapshot(foreignFingerprint))).toBe(true);
+    // A snapshot of a future schema version is foreign too, as long as it carries the
+    // fields every known version writes.
     expect(isForeignStopSnapshot({
       version: TASK_WATCHDOG_STOP_SNAPSHOT_VERSION + 1,
       fingerprint: "task_watchdog_stop:future",
+      materialLeaves: [],
+      waitsByIssueId: {},
     })).toBe(true);
     // Snapshots without a version tag are not treated as foreign.
     expect(isForeignStopSnapshot({ fingerprint: otherFingerprint })).toBe(false);
+    // A malformed snapshot is not a review this build can trust. It stays unreviewed, so
+    // the stopped subtree is verified again instead of being suppressed by junk.
+    expect(isForeignStopSnapshot({ version: 1 })).toBe(false);
+    expect(isForeignStopSnapshot({ version: 1, fingerprint: "" })).toBe(false);
+    expect(isForeignStopSnapshot({ version: 1, fingerprint: foreignFingerprint })).toBe(false);
+    expect(isForeignStopSnapshot({ version: 1, fingerprint: foreignFingerprint, leaves: "nope" })).toBe(false);
   });
 
-  it("treats a stop reviewed by another schema version as reviewed instead of triggering", () => {
+  it("verifies a stopped subtree again when the stored foreign snapshot is malformed", () => {
+    const malformed = { version: 1, fingerprint: foreignFingerprint };
+
+    const result = classify({
+      lastReviewedFingerprint: foreignFingerprint,
+      lastReviewedStopSnapshot: malformed,
+      lastCompletedAt: justWritten(),
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
+  it("treats a stop reviewed by another schema version as reviewed while that build still writes the row", () => {
     const result = classify({
       lastReviewedFingerprint: foreignFingerprint,
       lastReviewedStopSnapshot: foreignStopSnapshot(foreignFingerprint),
+      lastCompletedAt: justWritten(),
     });
 
     expect(result.state).toBe("already_reviewed");
     expect(result.reason).toContain("different stop-fingerprint schema version");
   });
 
+  it("takes the stopped subtree over once the foreign review's grace window has passed", () => {
+    // Regression (review finding): the foreign-schema branch used to answer
+    // "already_reviewed" unconditionally, so a foreign review never expired and this
+    // build could never take the row back — the watchdog stayed silent forever on a
+    // subtree it had never verified itself.
+    const result = classify({
+      lastReviewedFingerprint: foreignFingerprint,
+      lastReviewedStopSnapshot: foreignStopSnapshot(foreignFingerprint),
+      lastCompletedAt: writtenBeforeGraceWindow(),
+    });
+
+    expect(result.state).toBe("stopped");
+    expect(result.reason).toBe("No issue in the watched subtree has a live execution path.");
+  });
+
+  it("takes the stopped subtree over when the foreign row carries no readable timestamp", () => {
+    const result = classify({
+      lastReviewedFingerprint: foreignFingerprint,
+      lastReviewedStopSnapshot: foreignStopSnapshot(foreignFingerprint),
+      lastCompletedAt: null,
+      updatedAt: null,
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
   it("keeps a foreign stored snapshot readable on the production input path", () => {
     // Regression: the service used to pre-parse the stored snapshot under this build's
     // schema, which turned a foreign snapshot into null before the classifier could
     // inspect it. The production conversion must pass the stored value on unchanged.
-    const result = classifyStoredRow(foreignStopSnapshot(foreignFingerprint));
+    const result = classifyStoredRow(foreignStopSnapshot(foreignFingerprint), {
+      lastCompletedAt: justWritten(),
+    });
 
     expect(result.state).toBe("already_reviewed");
     expect(result.reason).toContain("different stop-fingerprint schema version");
+  });
+
+  it("takes a foreign stored snapshot over through the production input path after the window", () => {
+    const result = classifyStoredRow(foreignStopSnapshot(foreignFingerprint), {
+      lastCompletedAt: writtenBeforeGraceWindow(),
+    });
+
+    expect(result.state).toBe("stopped");
   });
 
   it("still triggers for a stored snapshot written under this schema version", () => {

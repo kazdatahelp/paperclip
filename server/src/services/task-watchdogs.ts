@@ -103,9 +103,12 @@ export type TaskWatchdogClassifierRelation = {
   blockedIssueId: string;
 };
 
+// lastCompletedAt and updatedAt decide how long a review written by another build can
+// keep the row: the classifier must see when the row was last written to expire a
+// foreign verdict that nobody refreshes.
 export type TaskWatchdogClassifierConfig = Pick<
   IssueWatchdogSummary,
-  "companyId" | "issueId" | "lastReviewedFingerprint"
+  "companyId" | "issueId" | "lastReviewedFingerprint" | "lastCompletedAt" | "updatedAt"
 > & {
   // The reviewed stop snapshot exactly as it is persisted in the watchdog row. It is
   // deliberately untyped: the row is shared with any other server build that points at
@@ -359,10 +362,27 @@ function materialLeaf(leaf: TaskWatchdogStoppedLeaf): TaskWatchdogMaterialLeaf {
 // over and re-verifies the stopped subtree normally.
 const TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS = 6 * 60 * 60 * 1000;
 
+// A stop snapshot written by another build must at least carry what every known schema
+// version writes: a version tag, the fingerprint it reviewed, and one of the two leaf
+// containers. Anything else is not a review this build can trust, so the stop stays
+// unreviewed and gets verified again.
 function stopSnapshotSchemaVersion(value: unknown): number | null {
   if (!value || typeof value !== "object") return null;
-  const version = (value as { version?: unknown }).version;
-  return typeof version === "number" ? version : null;
+  const candidate = value as {
+    version?: unknown;
+    fingerprint?: unknown;
+    leaves?: unknown;
+    materialLeaves?: unknown;
+    waitsByIssueId?: unknown;
+  };
+  if (typeof candidate.version !== "number") return null;
+  if (typeof candidate.fingerprint !== "string" || candidate.fingerprint.length === 0) return null;
+  const hasLegacyLeaves = Array.isArray(candidate.leaves);
+  const hasMaterialLeaves = Array.isArray(candidate.materialLeaves)
+    && Boolean(candidate.waitsByIssueId)
+    && typeof candidate.waitsByIssueId === "object";
+  if (!hasLegacyLeaves && !hasMaterialLeaves) return null;
+  return candidate.version;
 }
 
 export function isForeignStopSnapshot(value: unknown): boolean {
@@ -370,15 +390,39 @@ export function isForeignStopSnapshot(value: unknown): boolean {
   return version !== null && version !== TASK_WATCHDOG_STOP_SNAPSHOT_VERSION;
 }
 
+// Milliseconds since the watchdog row was last written by any build, or null when the
+// row carries no timestamp this process can read.
+function watchdogRowAgeMs(watchdog: {
+  lastCompletedAt?: Date | string | null;
+  updatedAt?: Date | string | null;
+}): number | null {
+  const seenAt = watchdog.lastCompletedAt ?? watchdog.updatedAt ?? null;
+  if (!seenAt) return null;
+  const age = Date.now() - new Date(seenAt).getTime();
+  return Number.isFinite(age) ? Math.max(age, 0) : null;
+}
+
 function foreignReviewGraceRemainingMs(watchdog: {
   lastCompletedAt?: Date | string | null;
   updatedAt?: Date | string | null;
 }): number {
-  const seenAt = watchdog.lastCompletedAt ?? watchdog.updatedAt ?? null;
-  if (!seenAt) return TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS;
-  const age = Date.now() - new Date(seenAt).getTime();
-  if (!Number.isFinite(age)) return TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS;
-  return TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS - Math.max(age, 0);
+  const age = watchdogRowAgeMs(watchdog);
+  if (age === null) return TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS;
+  return TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS - age;
+}
+
+// A foreign review outranks this build only while the other build is still writing the
+// row. After a full grace window without a write that build is gone (or idle), so this
+// build takes the row over and verifies the stopped subtree itself; otherwise the
+// foreign verdict would suppress every wake forever and the subtree could never be
+// re-checked. A row without a readable timestamp proves nothing and expires too.
+function foreignReviewStillOwnsRow(watchdog: {
+  lastCompletedAt?: Date | string | null;
+  updatedAt?: Date | string | null;
+}): boolean {
+  const age = watchdogRowAgeMs(watchdog);
+  if (age === null) return false;
+  return age < TASK_WATCHDOG_FOREIGN_REVIEW_GRACE_MS;
 }
 
 function parseStopSnapshot(value: unknown): TaskWatchdogStopSnapshot | null {
@@ -570,7 +614,11 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   };
 
   const reviewedStopSnapshot = parseStopSnapshot(input.watchdog.lastReviewedStopSnapshot);
-  const reviewedUnderForeignSchema = isForeignStopSnapshot(input.watchdog.lastReviewedStopSnapshot);
+  // A foreign-schema review only counts as reviewed while that build still owns the row.
+  // Once its grace window has passed this build re-verifies the subtree (takeover), so a
+  // stale foreign verdict cannot suppress watchdog wakes forever.
+  const reviewedUnderForeignSchema = isForeignStopSnapshot(input.watchdog.lastReviewedStopSnapshot)
+    && foreignReviewStillOwnsRow(input.watchdog);
   if (
     input.watchdog.lastReviewedFingerprint === stopFingerprint ||
     isShrinkOfReviewedSnapshot(currentStopSnapshot, reviewedStopSnapshot) ||
